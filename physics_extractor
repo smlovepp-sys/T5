@@ -1,0 +1,456 @@
+# physics_extractor.py —— 规则驱动 delta + 物体类别默认材质 + 显式材质覆盖
+import json
+import os
+import re
+import hashlib
+import torch
+import numpy as np
+from collections import OrderedDict
+from typing import Dict, List, Optional, Tuple
+
+class PhysicsExtractor:
+    PARAM_NAMES = [
+        "stiffness", "friction", "elasticity", "wetness",
+        "tear_intensity", "tension", "body_type"
+    ]
+    PARAM_BOUNDS = {
+        "stiffness":       (0.0, 1.0),
+        "friction":        (0.0, 1.0),
+        "elasticity":      (0.0, 1.0),
+        "wetness":         (0.0, 1.0),
+        "tear_intensity":  (0.0, 1.0),
+        "tension":         (-1.0, 1.0),
+        "body_type":       (0.0, 1.0),
+    }
+
+    AXIS_GAINS = {
+        "stiffness": 0.112,
+        "friction": 0.166,
+        "elasticity": 0.258,
+        "wetness": 0.157,
+        "tear_intensity": 0.400,
+        "tension": 0.115,
+        "body_type": 0.160,
+    }
+
+    # ---- 修饰词基础规则表 ----
+    MODIFIER_RULES = {
+        "wet":      {"wetness": +0.4, "friction": -0.2, "stiffness": -0.05},
+        "dry":      {"wetness": -0.3, "friction": +0.05, "stiffness": +0.03},
+        "torn":     {"tear_intensity": +0.4, "elasticity": -0.2, "friction": -0.1},
+        "broken":   {"tear_intensity": +0.35, "stiffness": -0.2, "elasticity": -0.1},
+        "cracked":  {"tear_intensity": +0.25, "stiffness": -0.1, "elasticity": -0.1},
+        "frozen":   {"stiffness": +0.3, "elasticity": -0.2, "wetness": -0.2},
+        "burning":  {"wetness": -0.3, "stiffness": -0.2, "tear_intensity": +0.2},
+        "heavy":    {"stiffness": +0.1, "body_type": +0.2},
+        "light":    {"stiffness": -0.1, "body_type": -0.2},
+    }
+
+    # ---- 材质类别敏感度表 ----
+    CATEGORY_SENSITIVITY = {
+        "织物":  {"stiffness":0.8, "friction":0.7, "elasticity":0.8, "wetness":1.0,
+                  "tear_intensity":0.8, "tension":0.5, "body_type":0.5},
+        "皮革":  {"stiffness":0.8, "friction":0.7, "elasticity":0.6, "wetness":0.6,
+                  "tear_intensity":0.8, "tension":0.5, "body_type":0.5},
+        "金属":  {"stiffness":1.0, "friction":1.0, "elasticity":0.5, "wetness":0.05,
+                  "tear_intensity":1.0, "tension":0.8, "body_type":0.8},
+        "木材":  {"stiffness":0.9, "friction":0.8, "elasticity":0.5, "wetness":0.8,
+                  "tear_intensity":0.7, "tension":0.5, "body_type":0.6},
+        "石材":  {"stiffness":1.0, "friction":0.9, "elasticity":0.2, "wetness":0.1,
+                  "tear_intensity":0.5, "tension":0.3, "body_type":0.7},
+        "塑料":  {"stiffness":0.6, "friction":0.6, "elasticity":0.8, "wetness":0.5,
+                  "tear_intensity":0.6, "tension":0.5, "body_type":0.5},
+        "玻璃":  {"stiffness":1.0, "friction":0.5, "elasticity":0.1, "wetness":0.1,
+                  "tear_intensity":0.3, "tension":0.2, "body_type":0.8},
+        "有机物": {"stiffness":0.4, "friction":0.5, "elasticity":0.8, "wetness":1.0,
+                  "tear_intensity":0.8, "tension":0.4, "body_type":0.4},
+        "液体":  {"stiffness":0.0, "friction":0.1, "elasticity":1.0, "wetness":1.0,
+                  "tear_intensity":0.5, "tension":0.5, "body_type":0.0},
+        "unknown": {"stiffness":0.5, "friction":0.5, "elasticity":0.5, "wetness":0.5,
+                    "tear_intensity":0.5, "tension":0.5, "body_type":0.5},
+    }
+
+    # ---- 物体类别 → 默认材质词 ----
+    OBJECT_TO_DEFAULT_MATERIAL = {
+        "clothing": "cotton",
+        "weapon": "steel",
+        "furniture": "wood",
+        "food": "bread",
+        "accessory": "silver",
+        "body_part": "skin",
+        "plant": "leaf",
+        "vehicle": "steel",
+        "environment": "stone",
+        "object": "plastic",
+    }
+
+    STATE_MODIFIERS = set(MODIFIER_RULES.keys())
+    DAMAGE_MODIFIERS = {
+        "torn", "broken", "cracked", "fractured", "shattered", "worn", "frayed",
+        "scratched", "dented", "bent", "crushed", "flattened", "punctured", "cut",
+        "ripped", "shredded", "melted", "charred", "rusted", "corroded"
+    }
+
+    ACTION_WORDS = {
+        "tear", "tears", "tearing", "break", "breaks", "breaking", "cut", "cuts",
+        "cutting", "wet", "wets", "wetting", "freeze", "freezes", "freezing",
+        "burn", "burns", "burning", "melt", "melts", "melting", "bend", "bends",
+        "bending", "wear", "wears", "wearing", "make", "makes", "making",
+        "build", "builds", "building", "construct", "constructs", "constructing"
+    }
+
+    BEST_ANCHORS = {
+        "stiffness":       {"hard": "granite",            "soft": "butter"},
+        "friction":        {"hard": "leather",            "soft": "cancellous_bone"},
+        "elasticity":      {"hard": "suede",              "soft": "eps_foam"},
+        "wetness":         {"hard": "latex_foam",         "soft": "chiffon"},
+        "tear_intensity":  {"hard": "alloy steel",        "soft": "phenolic"},
+        "tension":         {"hard": "zirconia_ceramic",   "soft": "mud"},
+        "body_type":       {"hard": "enamel",             "soft": "malachite"},
+    }
+
+    STOP_WORDS = {
+        'a','an','the','and','or','of','in','on','at','with','without','to','for','by',
+        'is','are','was','were','be','been','being','have','has','had','do','does','did',
+        'but','so','very','just','only','not','no','nor','too','can','will','would','should',
+        'could','may','might','must','this','that','these','those','it','they','we','you','he',
+        'she','it','there','their','some','any','such','both','each','few','more','most',
+        'other','own','same','than','just','doing'
+    }
+    IGNORE_WORDS = {
+        'woman','man','person','people','wearing','made','made_of','built','constructed',
+        'using','used','based','based_on','having','containing','contained','filled','filled_with',
+        'composed','composed_of','consisting','consist','consists','made_from','made_up'
+    }
+
+    def __init__(self, db_file: str = "material_full_complete.json"):
+        self.db_file = db_file
+        self.material_db = {}
+        self.param_entries = {p: [] for p in self.PARAM_NAMES}
+        self._sub_axes_cache = {}
+        self._text_cache = OrderedDict()
+        self._fingerprint = None
+        self._word_to_category = {}
+        self._category_words = {}
+        self._category_extremes = {}
+        self._cat_centroids = {}
+        self._load_data()
+
+    def _load_data(self):
+        if os.path.exists(self.db_file):
+            with open(self.db_file, 'r', encoding='utf-8') as f:
+                self.material_db = json.load(f)
+            self.MATERIAL_WORDS = set(self.material_db.keys())
+            for word, entry in self.material_db.items():
+                w = word.lower()
+                cat = entry.get("category", "unknown")
+                self._word_to_category[w] = cat
+                self._category_words.setdefault(cat, []).append(w)
+                for p in self.PARAM_NAMES:
+                    if p in entry:
+                        self.param_entries[p].append((w, entry[p]))
+            self._compute_category_extremes()
+
+    def _compute_category_extremes(self):
+        self._category_extremes = {}
+        for cat, words in self._category_words.items():
+            cat_extremes = {}
+            for p in self.PARAM_NAMES:
+                cat_entries = [(w, self.material_db[w][p]) for w in words if w in self.material_db and p in self.material_db[w]]
+                if len(cat_entries) >= 2:
+                    sorted_entries = sorted(cat_entries, key=lambda x: x[1])
+                    cat_extremes[p] = {
+                        "soft_word": sorted_entries[0][0],
+                        "soft_val": sorted_entries[0][1],
+                        "hard_word": sorted_entries[-1][0],
+                        "hard_val": sorted_entries[-1][1],
+                    }
+            self._category_extremes[cat] = cat_extremes
+
+    def _get_embedding_weight(self, clip):
+        if hasattr(clip, "model") and hasattr(clip.model, "shared"):
+            return clip.model.shared.weight
+        if hasattr(clip, "shared"):
+            return clip.shared.weight
+        raise AttributeError("无法获取 token embedding 权重")
+
+    def _compute_fingerprint(self, clip):
+        try:
+            w = self._get_embedding_weight(clip)
+            model_id = f"{type(clip).__name__}_{tuple(w.shape)}"
+            payload = w.data.flatten()[:1000].detach().cpu().numpy().tobytes() + model_id.encode()
+            return hashlib.sha256(payload).hexdigest()
+        except Exception:
+            return "unknown"
+
+    def _get_phrase_embedding(self, phrase: str, clip) -> Optional[torch.Tensor]:
+        w_emb = self._get_embedding_weight(clip)
+        device = w_emb.device
+        tokenizer = clip.tokenizer
+        tokens = phrase.lower().split()
+        ids_list = []
+        for token in tokens:
+            ids = tokenizer.encode(token, add_special_tokens=False)
+            if ids:
+                ids_list.extend(ids)
+        if not ids_list:
+            ids_list = tokenizer.encode(phrase, add_special_tokens=False) or [tokenizer.pad_token_id or 0]
+        token_tensor = torch.tensor(ids_list, device=device)
+        token_emb = w_emb[token_tensor].mean(dim=0)
+        return (token_emb / (token_emb.norm() + 1e-6)).detach()
+
+    def _get_text_embedding(self, text: str, clip) -> Optional[torch.Tensor]:
+        if hasattr(clip, 'encode_text'):
+            try:
+                with torch.no_grad():
+                    try:
+                        emb = clip.encode_text(text)
+                    except TypeError:
+                        tokens = clip.tokenize([text]).to(clip.device)
+                        out = clip.encode_text(tokens)
+                        if isinstance(out, tuple):
+                            emb = out[0].mean(dim=1)[0]
+                        else:
+                            emb = out
+                if emb is not None:
+                    if emb.dim() == 2:
+                        emb = emb[0]
+                    return emb.detach()
+            except Exception:
+                pass
+        if hasattr(clip, 'model') and hasattr(clip.model, 'encoder'):
+            try:
+                tokenizer = clip.tokenizer
+                tokens = tokenizer(text, return_tensors='pt', truncation=True, padding=True).to(clip.model.device)
+                with torch.no_grad():
+                    outputs = clip.model.encoder(**tokens)
+                hidden = outputs.last_hidden_state.mean(dim=1)[0]
+                return hidden.detach()
+            except Exception:
+                pass
+        return self._get_phrase_embedding(text, clip)
+
+    def _get_emb(self, text, clip):
+        if text in self._text_cache:
+            return self._text_cache[text]
+        emb = self._get_text_embedding(text, clip)
+        if emb is None:
+            return None
+        emb = emb / (emb.norm() + 1e-6)
+        if len(self._text_cache) >= 1024:
+            self._text_cache.popitem(last=False)
+        self._text_cache[text] = emb
+        return emb
+
+    def _ensure_sub_axes(self, clip):
+        fp = self._compute_fingerprint(clip)
+        if self._fingerprint != fp or not self._sub_axes_cache:
+            self._text_cache.clear()
+            self._sub_axes_cache.clear()
+            self._fingerprint = fp
+
+            for param in self.PARAM_NAMES:
+                if param in self.BEST_ANCHORS:
+                    hard_word = self.BEST_ANCHORS[param]["hard"]
+                    soft_word = self.BEST_ANCHORS[param]["soft"]
+                else:
+                    entries = self.param_entries[param]
+                    if len(entries) < 2:
+                        continue
+                    sorted_entries = sorted(entries, key=lambda x: x[1])
+                    soft_word = sorted_entries[0][0]
+                    hard_word = sorted_entries[-1][0]
+
+                soft_emb = self._get_emb(soft_word, clip)
+                hard_emb = self._get_emb(hard_word, clip)
+                if soft_emb is None or hard_emb is None:
+                    continue
+                axis = hard_emb - soft_emb
+                self._sub_axes_cache[param] = axis / (axis.norm() + 1e-6)
+
+            self._cat_centroids = {}
+            for cat, words in self._category_words.items():
+                embs = [self._get_emb(w, clip) for w in words]
+                embs = [e.cpu().numpy() for e in embs if e is not None]
+                if embs:
+                    cent = np.mean(embs, axis=0)
+                    self._cat_centroids[cat] = cent / (np.linalg.norm(cent) + 1e-6)
+
+    def _check_and_rebuild(self, clip):
+        self._ensure_sub_axes(clip)
+
+    def _get_category(self, word: str, emb_np: np.ndarray) -> Optional[str]:
+        if word.lower() in self._word_to_category:
+            return self._word_to_category[word.lower()]
+        if not self._cat_centroids:
+            return None
+        best_cat, best_sim = None, -2.0
+        for cat, cent in self._cat_centroids.items():
+            sim = np.dot(emb_np, cent)
+            if sim > best_sim:
+                best_sim = sim
+                best_cat = cat
+        return best_cat
+
+    def _get_mapping_params(self, cat: Optional[str], param: str) -> tuple:
+        lo, hi = self.PARAM_BOUNDS[param]
+        if cat and cat in self._category_extremes and param in self._category_extremes[cat]:
+            cat_ext = self._category_extremes[cat][param]
+            return cat_ext["soft_val"], cat_ext["hard_val"]
+        entries = self.param_entries[param]
+        if len(entries) >= 2:
+            sorted_entries = sorted(entries, key=lambda x: x[1])
+            return sorted_entries[0][1], sorted_entries[-1][1]
+        return lo, hi
+
+    def _get_physics_for_word(self, word: str, clip) -> Dict[str, float]:
+        """获取单词物理：数据库优先，否则用 T5 投影"""
+        self._ensure_sub_axes(clip)
+        if word in self.material_db:
+            entry = self.material_db[word]
+            phys = {}
+            for p in self.PARAM_NAMES:
+                if p in entry:
+                    phys[p] = float(entry[p])
+                else:
+                    phys[p] = 0.5 if p != "tension" else 0.0
+            for p in self.PARAM_NAMES:
+                lo, hi = self.PARAM_BOUNDS[p]
+                phys[p] = float(np.clip(phys[p], lo, hi))
+            return phys
+        emb = self._get_emb(word, clip)
+        if emb is None:
+            return {p: (self.PARAM_BOUNDS[p][0] + self.PARAM_BOUNDS[p][1]) / 2 for p in self.PARAM_NAMES}
+        emb_np = emb.cpu().numpy()
+        cat = self._get_category(word, emb_np)
+        phys = {}
+        for param in self.PARAM_NAMES:
+            if param in self._sub_axes_cache:
+                axis = self._sub_axes_cache[param]
+                gain = self.AXIS_GAINS.get(param, 1.0)
+                proj = torch.dot(emb, axis).item() * gain
+                lo, hi = self.PARAM_BOUNDS[param]
+                scale = 6.0 * (gain / 0.2) ** 0.3
+                raw = np.tanh(scale * proj)
+                soft_val, hard_val = self._get_mapping_params(cat, param)
+                if lo == 0.0 and hi == 1.0:
+                    norm_val = (raw + 1) / 2
+                    val = soft_val + (hard_val - soft_val) * norm_val
+                else:
+                    norm_val = (raw + 1) / 2
+                    val = soft_val + (hard_val - soft_val) * norm_val
+                phys[param] = float(np.clip(val, lo, hi))
+            else:
+                phys[param] = 0.5 if param != "tension" else 0.0
+        return phys
+
+    def _get_modifier_rule(self, modifier: str) -> Optional[Dict[str, float]]:
+        return self.MODIFIER_RULES.get(modifier)
+
+    def _get_sensitivity_for_category(self, category: str) -> Dict[str, float]:
+        return self.CATEGORY_SENSITIVITY.get(category, self.CATEGORY_SENSITIVITY["unknown"])
+
+    def _compute_rule_delta(self, modifier: str, base_category: str) -> Dict[str, float]:
+        rule = self._get_modifier_rule(modifier)
+        if not rule:
+            return {p: 0.0 for p in self.PARAM_NAMES}
+        sensitivity = self._get_sensitivity_for_category(base_category)
+        delta = {}
+        for p in self.PARAM_NAMES:
+            base_delta = rule.get(p, 0.0)
+            delta[p] = base_delta * sensitivity.get(p, 1.0)
+        return delta
+
+    def get_physics_with_context(self,
+                                 base_word: str,
+                                 object_class: Optional[str],
+                                 modifiers: List[str],
+                                 explicit_material: Optional[str] = None,
+                                 clip=None) -> Dict[str, float]:
+        """
+        根据显式材质或物体类别默认材质，组合基础物理和修饰词 delta。
+        """
+        if explicit_material and explicit_material in self.material_db:
+            base_phys = self._get_physics_for_word(explicit_material, clip)
+            base_category = self.material_db[explicit_material].get("category", "unknown")
+        elif base_word in self.material_db:
+            base_phys = self._get_physics_for_word(base_word, clip)
+            base_category = self.material_db[base_word].get("category", "unknown")
+        else:
+            if object_class and object_class in self.OBJECT_TO_DEFAULT_MATERIAL:
+                default_material = self.OBJECT_TO_DEFAULT_MATERIAL[object_class]
+                if default_material in self.material_db:
+                    base_phys = self._get_physics_for_word(default_material, clip)
+                    base_category = self.material_db[default_material].get("category", "unknown")
+                else:
+                    base_phys = {p: 0.5 for p in self.PARAM_NAMES}
+                    base_category = "unknown"
+            else:
+                base_phys = self._get_physics_for_word(base_word, clip)
+                base_category = "unknown"
+
+        for mod in modifiers:
+            delta = self._compute_rule_delta(mod, base_category)
+            for p in self.PARAM_NAMES:
+                base_phys[p] += delta.get(p, 0.0)
+
+        result = {}
+        for p in self.PARAM_NAMES:
+            lo, hi = self.PARAM_BOUNDS[p]
+            result[p] = round(float(np.clip(base_phys[p], lo, hi)), 4)
+        return result
+
+    def _split_semantics(self, text: str) -> Tuple[str, List[str]]:
+        clean = re.sub(r'\(.*?:\d+\.?\d*\)', '', text)
+        clean = re.sub(r'[()]', '', clean).strip().lower()
+        words = clean.split()
+
+        meaningful = []
+        for w in words:
+            if w in self.STOP_WORDS or w in self.IGNORE_WORDS:
+                continue
+            if w in self.ACTION_WORDS and w not in self.STATE_MODIFIERS and w not in self.material_db:
+                continue
+            meaningful.append(w)
+
+        if not meaningful:
+            return "", []
+
+        base = None
+        modifiers = []
+        for i in range(len(meaningful)-1, -1, -1):
+            if meaningful[i] in self.material_db:
+                base = meaningful[i]
+                for j in range(i-1, -1, -1):
+                    if meaningful[j] in self.STATE_MODIFIERS or meaningful[j] in self.DAMAGE_MODIFIERS:
+                        modifiers.insert(0, meaningful[j])
+                break
+
+        if base is None:
+            base = meaningful[-1]
+            for j in range(len(meaningful)-2, -1, -1):
+                if meaningful[j] in self.STATE_MODIFIERS or meaningful[j] in self.DAMAGE_MODIFIERS:
+                    modifiers.insert(0, meaningful[j])
+
+        return base, modifiers
+
+    def extract_from_text(self, prompt: str, clip) -> Dict[str, float]:
+        """保留的旧接口，用于简单测试。"""
+        self._ensure_sub_axes(clip)
+        prompt = prompt.strip()
+        if not prompt:
+            return {p: (self.PARAM_BOUNDS[p][0] + self.PARAM_BOUNDS[p][1]) / 2 for p in self.PARAM_NAMES}
+
+        base, modifiers = self._split_semantics(prompt)
+        if not base:
+            return self._get_physics_for_word(prompt, clip)
+        return self.get_physics_with_context(base_word=base, object_class=None,
+                                             modifiers=modifiers, explicit_material=None, clip=clip)
+
+    def extract_full_physics_vectors(self, text: str, clip) -> Dict[str, float]:
+        return self.extract_from_text(text, clip)
+
+    def clear_cache(self):
+        self._text_cache.clear()
+        self._sub_axes_cache.clear()
+        self._fingerprint = None
