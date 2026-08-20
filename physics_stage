@@ -1,0 +1,815 @@
+# physics_stage.py (完整版，修正材质修饰词绑定)
+import logging
+import sys
+import re
+import torch
+import numpy as np
+from collections import OrderedDict, defaultdict
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple, Union
+from transformers import T5TokenizerFast, T5EncoderModel
+from scipy.optimize import linear_sum_assignment
+
+from physics_extractor import PhysicsExtractor
+
+logger = logging.getLogger("PhysicsStage")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(name)s | %(message)s"))
+    logger.addHandler(handler)
+
+
+# ==================== load_t5_clip ====================
+def load_t5_clip(model_path: str = None):
+    if model_path is None: model_path = "t5-small"
+    tokenizer = T5TokenizerFast.from_pretrained(model_path)
+    model = T5EncoderModel.from_pretrained(model_path).eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    class T5ClipWrapper:
+        def __init__(self, m, t):
+            self.model = m
+            self.tokenizer = t
+            self.shared = m.get_input_embeddings()
+            self.device = device
+        def tokenize(self, texts):
+            if isinstance(texts, str): texts = [texts]
+            return self.tokenizer(texts, return_tensors="pt", padding=True, truncation=True)["input_ids"]
+        def encode_text(self, tokens, return_pooled=False):
+            with torch.no_grad():
+                tokens = tokens.to(self.device)
+                outputs = self.model(input_ids=tokens)
+            last_hidden = outputs.last_hidden_state
+            if return_pooled: return last_hidden, last_hidden.mean(dim=1)
+            return (last_hidden,)
+    return T5ClipWrapper(model, tokenizer), tokenizer
+
+
+# ==================== 数据结构 ====================
+@dataclass
+class PhysicsMaterial:
+    stiffness: float = 0.5; friction: float = 0.5; elasticity: float = 0.5; wetness: float = 0.5
+    tear_intensity: float = 0.5; tension: float = 0.0; body_type: float = 0.5
+    mass: float = 1.0; youngs_modulus: float = 1e6; friction_static: float = 0.5; friction_dynamic: float = 0.4
+    restitution: float = 0.1; damping: float = 0.1; tear_threshold: float = 1000.0; initial_tension: float = 0.0
+
+@dataclass
+class SurfaceLayer: layer_id: str; type: str; texture_ref: str = ""; break_behavior: str = "none"; dynamic_properties: Dict[str, float] = field(default_factory=dict)
+@dataclass
+class Collider: type: str = "box"; size: List[float] = field(default_factory=list); is_soft_body: bool = False
+@dataclass
+class Constraint: id: str; type: str; source_prop: str; target_prop: str; source_anchor: List[float] = field(default_factory=lambda: [0,0,0]); target_anchor: List[float] = field(default_factory=lambda: [0,0,0]); parameters: Dict[str, float] = field(default_factory=dict); break_behavior: str = "none"
+@dataclass
+class Prop: id: str; name: str; class_type: str; physics_material: PhysicsMaterial = field(default_factory=PhysicsMaterial); collider: Collider = field(default_factory=Collider); surface_layers: List[SurfaceLayer] = field(default_factory=list); identity_embedding: Optional[List[float]] = None; layer_order: int = 0; tags: List[str] = field(default_factory=list); initial_constraints: List[Constraint] = field(default_factory=list, repr=False); is_worn: bool = True; source_phrase: str = ""
+@dataclass
+class KeyframeEvent: type: str; target: str; parameters: Dict[str, Any] = field(default_factory=dict)
+@dataclass
+class Keyframe: timestamp: float; events: List[KeyframeEvent] = field(default_factory=list)
+@dataclass
+class WorldConfig: gravity: List[float] = field(default_factory=lambda: [0, -9.8, 0]); wind_direction: List[float] = field(default_factory=lambda: [1,0,0]); wind_strength: float = 0.0; wind_turbulence: float = 0.0; time_step: float = 0.016; solver_iterations: int = 10
+@dataclass
+class SceneDescription: world: WorldConfig = field(default_factory=WorldConfig); props: List[Prop] = field(default_factory=list); keyframes: List[Keyframe] = field(default_factory=list)
+
+
+# ==================== EmbedUtils ====================
+class EmbedUtils:
+    def __init__(self, clip_model): self.clip = clip_model; self.device = next(clip_model.model.parameters()).device; self._cache = {}
+    def get_embedding(self, text):
+        if text not in self._cache:
+            tokens = self.clip.tokenize([text]).to(self.device)
+            with torch.no_grad(): out = self.clip.model(input_ids=tokens)
+            self._cache[text] = out.last_hidden_state.mean(dim=1).squeeze(0)
+        return self._cache[text]
+    def similarity(self, t1, t2):
+        e1 = self.get_embedding(t1); e2 = self.get_embedding(t2)
+        return torch.cosine_similarity(e1.unsqueeze(0), e2.unsqueeze(0), dim=1).item()
+
+
+# ==================== 动态阈值计算函数 ====================
+def get_dynamic_thresholds(sim_sample_list, delta_sample_list,
+                           low_quantile=0.3, mid_quantile=0.5, high_quantile=0.7):
+    if len(sim_sample_list) < 5 or len(delta_sample_list) < 5:
+        return {
+            "mod_low": 0.25, "mod_mid": 0.30, "mod_high": 0.40,
+            "verb_cut": 0.25, "noun_cut": 0.45,
+            "delta_weak": 0.05, "delta_strong": 0.30,
+            "diff_small": 0.05, "diff_mid": 0.08
+        }
+
+    sim_arr = np.array(sim_sample_list)
+    mod_all = sim_arr[:, 0]
+    verb_all = sim_arr[:, 1]
+    noun_all = sim_arr[:, 2]
+    delta_abs_arr = np.abs(np.array(delta_sample_list))
+
+    th_mod_low = np.quantile(mod_all, low_quantile)
+    th_mod_mid = np.quantile(mod_all, mid_quantile)
+    th_mod_high = np.quantile(mod_all, high_quantile)
+
+    th_verb_cut = np.quantile(verb_all, mid_quantile)
+    th_noun_cut = np.quantile(noun_all, mid_quantile)
+
+    th_delta_weak = np.quantile(delta_abs_arr, low_quantile)
+    th_delta_strong = np.quantile(delta_abs_arr, high_quantile)
+
+    diff_raw = np.abs(mod_all - verb_all)
+    diff_median = np.median(diff_raw)
+    th_diff_small = max(diff_median * 0.8, 0.03)
+    th_diff_mid   = max(diff_median * 1.2, 0.06)
+
+    return {
+        "mod_low": th_mod_low,
+        "mod_mid": th_mod_mid,
+        "mod_high": th_mod_high,
+        "verb_cut": th_verb_cut,
+        "noun_cut": th_noun_cut,
+        "delta_weak": th_delta_weak,
+        "delta_strong": th_delta_strong,
+        "diff_small": th_diff_small,
+        "diff_mid": th_diff_mid
+    }
+
+
+# ==================== PropAssembler ====================
+class PropAssembler:
+    CLASS_PROTOTYPES = {
+        "body_part": "human body skin hand foot leg arm head face knee elbow",
+        "clothing": "garment clothing apparel shirt pants jacket armor boot shoe glove hat scarf sock",
+        "environment": "water rain wind fog mud dust weather snow",
+        "plant": "vine plant tree flower leaf",
+        "accessory": "belt ring necklace watch jewelry",
+        "weapon": "sword knife axe hammer bow arrow gun spear dagger",
+        "food": "apple bread meat cake fruit vegetable soup drink",
+        "vehicle": "car bike wagon cart boat ship plane",
+        "furniture": "table chair bed desk cabinet shelf couch",
+        "person": "person human man woman child girl",
+        "object": "object item thing device tool utensil furniture",
+    }
+    WEAR_PROTOTYPES = {"foot": "boot shoe sock", "hand": "glove ring", "head": "hat helmet", "torso": "shirt jacket armor dress coat", "leg": "pants trousers", "neck": "scarf necklace"}
+    BODY_PART_NAMES = {"skin", "hand", "foot", "body", "head", "leg", "arm", "face", "knee", "elbow", "neck"}
+    PARAM_NAMES = ["stiffness", "friction", "elasticity", "wetness", "tear_intensity", "tension", "body_type"]
+    DROPPED_KEYWORDS = {"on the floor", "on the ground", "dropped", "fallen", "lying", "detached", "off"}
+
+    PREPOSITIONS = {"with", "on", "in", "at", "of", "for", "by", "to", "from", "into", "onto", "upon", "within", "without", "over", "under", "through", "across", "along", "around", "between", "among", "against", "beside", "beneath", "during", "before", "after", "above", "below", "off", "up", "down", "out", "inside", "outside", "nearby"}
+
+    DANBOORU_TAG_MAP = {"1girl": "girl", "2girls": "girl", "3girls": "girl", "1boy": "boy", "2boys": "boy", "3boys": "boy", "1person": "person", "2people": "person", "3people": "person"}
+    NON_PHYSICAL_TAGS = {"solo", "looking_at_viewer", "detailed_background", "simple_background", "from_side", "from_behind", "close-up", "full_body", "half_body", "portrait"}
+
+    PROTO_MODIFIERS = ["wet", "dry", "frozen", "oiled", "stretched", "torn", "shredded", "polished", "crushed", "scratched", "ripped", "dried", "melted", "burned", "worn", "bent", "cracked", "chipped", "faded", "stained", "soaked", "drenched", "heated", "cooled", "rusty", "powdered", "young", "old", "new", "beautiful", "ancient", "mysterious"]
+    PROTO_VERBS = ["holding", "falling", "pushing", "carrying", "dropping", "wearing", "taking", "walking", "standing", "lying", "crunching", "resting", "sitting", "running"]
+    PROTO_NOUNS = ["steel", "paper", "water", "girl", "cup", "fabric", "metal", "book", "dress", "sword", "floor", "woman", "man", "table", "scarf", "candle", "plate", "cheese", "milk", "toast", "fork", "napkin", "shield", "armor", "boot", "coat", "torch", "ground", "leaf", "umbrella", "enemy", "battlefield", "warrior", "apron", "boy", "bowl", "pan", "kitchen", "counter", "chef"]
+
+    # 材质形容词映射表：形容词 -> 实际材质词（在 material_db 中可能存在）
+    MATERIAL_ADJECTIVE_MAP = {
+        "golden": "gold",
+        "wooden": "wood",
+        "silver": "silver",
+        "iron": "iron",
+        "steel": "steel",
+        "glass": "glass",
+        "stone": "stone",
+        "plastic": "plastic",
+        "leather": "leather",
+        "silk": "silk",
+        "cotton": "cotton",
+        "wool": "wool",
+        "metal": "steel",   # 通用金属默认钢铁
+    }
+
+    # 地点/背景词，不作为核心物体，但可保留为环境或忽略
+    LOCATION_WORDS = {"floor", "ground", "table", "hand", "wall", "bed", "chair", "room", "kitchen", "counter", "desk", "shelf", "door", "window", "street", "road", "ceiling"}
+
+    TRIGGER_CONFIGS = {
+        "撕裂类": {"bases": ["underwear", "dress", "fabric"], "param": "tear_intensity", "threshold": 0.08},
+        "湿润类": {"bases": ["paper", "sand", "cotton"], "param": "wetness", "threshold": 0.50},
+        "硬度类": {"bases": ["rubber", "paper"], "param": "stiffness", "threshold": 0.30},
+        "摩擦类": {"bases": ["metal", "glass", "steel"], "param": "friction", "threshold": 0.20},
+        "形变类": {"bases": ["stone", "glass", "paper"], "param": "stiffness", "threshold": -0.10, "direction": "negative"},
+    }
+
+    def __init__(self, clip_model):
+        self.utils = EmbedUtils(clip_model); self.clip = clip_model; self.extractor = None
+        self.device = next(clip_model.model.parameters()).device
+        self._proto_mod_emb = torch.stack([self.utils.get_embedding(w) for w in self.PROTO_MODIFIERS])
+        self._proto_verb_emb = torch.stack([self.utils.get_embedding(w) for w in self.PROTO_VERBS])
+        self._proto_noun_emb = torch.stack([self.utils.get_embedding(w) for w in self.PROTO_NOUNS])
+        self._hypernym_emb = torch.stack([self.utils.get_embedding(w) for w in ["person", "object"]])
+        self._all_modifiers = {}
+        self._pure_modifiers = set()
+        self.thresh = {
+            "mod_low": 0.25, "mod_mid": 0.30, "mod_high": 0.40,
+            "verb_cut": 0.25, "noun_cut": 0.45,
+            "delta_weak": 0.05, "delta_strong": 0.30,
+            "diff_small": 0.05, "diff_mid": 0.08
+        }
+
+    def set_extractor(self, extractor): self.extractor = extractor
+    def _cosine_sim(self, word_emb, group_emb): return torch.cosine_similarity(word_emb.unsqueeze(0), group_emb).mean().item()
+
+        def _is_profession_modifier(self, word):
+        # 材质词/材质形容词绝不可能是职业修饰词
+        if self.extractor and (word in self.extractor.material_db or word in self.MATERIAL_ADJECTIVE_MAP):
+            return False
+        emb = self.utils.get_embedding(word)
+        anchors = {"person", "man", "woman", "warrior", "girl", "boy"}
+        max_sim = 0.0
+        for a in anchors:
+            a_emb = self.utils.get_embedding(a)
+            sim = torch.cosine_similarity(emb, a_emb, dim=0).item()
+            if sim > max_sim: max_sim = sim
+        return max_sim > 0.45
+
+    def _gate1_sensitive_trigger(self, word):
+        best_type, best_delta = None, 0.0
+        for trigger_type, config in self.TRIGGER_CONFIGS.items():
+            bases, param, threshold, direction = config["bases"], config["param"], config["threshold"], config.get("direction", "positive")
+            deltas = []
+            for base in bases:
+                phys_base = self.extractor.extract_from_text(base, self.clip)
+                phys_comb = self.extractor.extract_from_text(f"{word} {base}", self.clip)
+                deltas.append(phys_comb[param] - phys_base[param])
+            if direction == "negative":
+                trigger_val = min(deltas)
+                if trigger_val < threshold and abs(trigger_val) > abs(best_delta): best_type, best_delta = trigger_type, trigger_val
+            else:
+                max_d = max(deltas)
+                if max_d > threshold and max_d > best_delta: best_type, best_delta = trigger_type, max_d
+        if best_type: return True, best_type, best_delta
+        return False, None, 0.0
+
+    def _gate3_semantic(self, word):
+        emb = self.utils.get_embedding(word)
+        mod_sim = self._cosine_sim(emb, self._proto_mod_emb)
+        verb_sim = self._cosine_sim(emb, self._proto_verb_emb)
+        noun_sim = self._cosine_sim(emb, self._proto_noun_emb)
+        hyper_sim = self._cosine_sim(emb, self._hypernym_emb)
+        noun_sim = max(noun_sim, hyper_sim)
+        return mod_sim, verb_sim, noun_sim
+
+    def _classify_phrase_type(self, phrase):
+        if self.extractor is None: return "物体词"
+        if len(phrase) <= 1: return "结构词"
+        if phrase.lower() in {"a","an","the","she","he","it","we","they","his","her","their","is","are","was","were","be","been","and","or","of","in","on","at","to","for","by","with","has","have","had","do","does","did"}: return "结构词"
+
+        # 优先检查是否为显式材质词（在数据库或材质形容词映射中）
+        if phrase in self.extractor.material_db:
+            # 如果它是材质词且不是常见物体名词，则视为修饰词（材质修饰）
+            if phrase not in self.PROTO_NOUNS:
+                return "修饰词"
+            # 如果它在 PROTO_NOUNS 中也存在，可能是概念词？但像 metal 既是材质又是名词，我们暂时让它作为物体词还是修饰词？对于 sword 前有 metal，我们可能希望 metal 作为材质修饰。所以这里可以强制为修饰词，除非它单独出现。
+            # 但为了避免影响单独出现的金属概念，我们可以保留为物体词？根据需求，我们优先材质修饰，因此返回修饰词
+            return "修饰词"
+
+        # 检查材质形容词映射
+        if phrase in self.MATERIAL_ADJECTIVE_MAP:
+            return "修饰词"
+
+        # 原有逻辑
+        if phrase.lower() in self.PROTO_MODIFIERS and phrase.lower() not in self.PROTO_NOUNS: return "修饰词"
+        if phrase.lower() in self.PROTO_NOUNS: return "物体词"
+
+        passed_g1, trigger_type, max_delta = self._gate1_sensitive_trigger(phrase)
+        mod_sim, verb_sim, noun_sim = self._gate3_semantic(phrase)
+
+        th = self.thresh
+        if mod_sim > th["mod_low"] and (verb_sim - mod_sim) < th["diff_mid"] and not phrase.endswith(("ing", "ed")):
+            return "修饰词"
+        if abs(max_delta) < th["delta_weak"]:
+            if noun_sim > th["noun_cut"] and noun_sim > mod_sim and noun_sim > verb_sim: return "物体词"
+            return "结构词"
+        if phrase.endswith("ing") and verb_sim > th["verb_cut"] and mod_sim - verb_sim < th["diff_small"]: return "动词"
+        if passed_g1 and abs(max_delta) > th["delta_strong"] and not phrase.endswith("ing"):
+            if noun_sim > th["noun_cut"] and noun_sim > mod_sim and noun_sim > verb_sim: return "物体词"
+            return "修饰词"
+        if passed_g1 and mod_sim > th["mod_mid"] and mod_sim > verb_sim + th["diff_mid"]: return "修饰词"
+        if mod_sim > th["mod_high"] and mod_sim > verb_sim + th["diff_mid"] and not phrase.endswith("ing"): return "修饰词"
+        if verb_sim > mod_sim and verb_sim > noun_sim and verb_sim > th["verb_cut"]: return "动词"
+        if noun_sim > mod_sim and noun_sim > verb_sim: return "物体词"
+        return "结构词"
+
+    # ---------- 核心对象提取 ----------
+    def _extract_core_objects(self, prompt, phrases_physics):
+        clauses = [c.strip() for c in prompt.split(",") if c.strip()]
+        all_objects = {}
+        all_verbs = []
+        entity_positions = {}
+        all_modifiers = {}
+        pure_modifiers = set()
+
+        SPLITTERS = self.PREPOSITIONS | {"and", "with", "without", "near", "against", "beside", "inside", "outside", "above", "below"}
+
+        for clause in clauses:
+            words = clause.lower().split()
+            segments = []
+            current = []
+            for w in words:
+                if w in SPLITTERS:
+                    if current:
+                        segments.append(current)
+                        current = []
+                else:
+                    current.append(w)
+            if current:
+                segments.append(current)
+
+            for seg in segments:
+                if not seg: continue
+                mapped_seg = []
+                for w in seg:
+                    if w in self.DANBOORU_TAG_MAP: mapped_seg.append(self.DANBOORU_TAG_MAP[w])
+                    elif w in self.NON_PHYSICAL_TAGS: continue
+                    else: mapped_seg.append(w)
+                seg = mapped_seg
+                if not seg: continue
+
+                for w in seg:
+                    if self._classify_phrase_type(w) == "动词":
+                        all_verbs.append(w)
+
+                content = [w for w in seg if self._classify_phrase_type(w) not in ("结构词", "动词") and w not in (",", ".", ";")]
+                if not content:
+                    for w in seg:
+                        if self._classify_phrase_type(w) == "结构词":
+                            _, _, ns = self._gate3_semantic(w)
+                            if ns > 0.35:
+                                content.append(w)
+                    if not content: continue
+
+                current_mods = []
+                for w in content:
+                    ptype = self._classify_phrase_type(w)
+                    if ptype == "物体词":
+                        if w not in all_objects:
+                            all_objects[w] = {"modifiers": current_mods.copy(), "phys": {}}
+                        else:
+                            for mod in current_mods:
+                                if mod not in all_objects[w]["modifiers"]:
+                                    all_objects[w]["modifiers"].append(mod)
+                        match = re.search(r'\b' + re.escape(w) + r'\b', prompt, re.IGNORECASE)
+                        if match:
+                            preceding = prompt[:match.start()].split()
+                            entity_positions[w] = len(preceding)
+                        else:
+                            entity_positions[w] = -1
+                        all_modifiers[w] = {"modifiers": [], "phys": {}}
+                        current_mods = []
+                    elif ptype == "修饰词":
+                        # 如果修饰词实际上是材质词/材质形容词，我们保留它作为显式材质信息，但同时也可作为普通修饰词
+                        # 这里先保留，后续在计算物理时进行分离
+                        if self._is_profession_modifier(w):
+                            if w not in all_objects:
+                                all_objects[w] = {"modifiers": current_mods.copy(), "phys": {}}
+                            else:
+                                for mod in current_mods:
+                                    if mod not in all_objects[w]["modifiers"]:
+                                        all_objects[w]["modifiers"].append(mod)
+                            match = re.search(r'\b' + re.escape(w) + r'\b', prompt, re.IGNORECASE)
+                            if match:
+                                preceding = prompt[:match.start()].split()
+                                entity_positions[w] = len(preceding)
+                            else:
+                                entity_positions[w] = -1
+                            all_modifiers[w] = {"modifiers": [], "phys": {}}
+                            current_mods = []
+                        else:
+                            pure_modifiers.add(w)
+                            all_modifiers[w] = {"modifiers": [], "phys": {}}
+                        current_mods.append(w)
+
+        # 使用新的 get_physics_with_context 计算每个物体的物理
+        for core_noun, data in all_objects.items():
+            modifiers = data["modifiers"]
+            object_class = self._classify(core_noun)
+
+            # 分离显式材质词和状态/损伤修饰词
+            explicit_material = None
+            state_mods = []
+            for mod in modifiers:
+                if mod in self.extractor.material_db or mod in self.MATERIAL_ADJECTIVE_MAP:
+                    # 如果是材质形容词，映射到实际材质词
+                    actual_material = self.MATERIAL_ADJECTIVE_MAP.get(mod, mod)
+                    explicit_material = actual_material
+                elif mod in self.extractor.STATE_MODIFIERS or mod in self.extractor.DAMAGE_MODIFIERS:
+                    state_mods.append(mod)
+                else:
+                    # 未知修饰词忽略
+                    pass
+
+            phys = self.extractor.get_physics_with_context(
+                base_word=core_noun,
+                object_class=object_class,
+                modifiers=state_mods,
+                explicit_material=explicit_material,
+                clip=self.clip
+            )
+            for k in self.PARAM_NAMES:
+                data["phys"][k] = phys[k]
+
+        # 修饰词单独作为对象时，保留原有物理提取（仅为兼容，实际可忽略）
+        for mod, data in all_modifiers.items():
+            base_phys = self.extractor.extract_from_text(mod, self.clip)
+            for k in self.PARAM_NAMES:
+                data["phys"][k] = base_phys[k]
+
+        self._all_modifiers = all_modifiers
+        self._pure_modifiers = pure_modifiers
+        return all_objects, all_verbs, entity_positions
+
+    # ---------- 主组装 ----------
+    def assemble(self, phrases_physics, prompt):
+        words_from_prompt = set(prompt.lower().split())
+        proto_pool = set(self.PROTO_MODIFIERS + self.PROTO_VERBS + self.PROTO_NOUNS)
+        all_candidate_words = list(words_from_prompt | proto_pool)
+
+        sim_buffer = []
+        delta_buffer = []
+        for word in all_candidate_words:
+            if self.extractor is None:
+                continue
+            try:
+                mod_sim, verb_sim, noun_sim = self._gate3_semantic(word)
+                _, _, max_delta = self._gate1_sensitive_trigger(word)
+                sim_buffer.append([mod_sim, verb_sim, noun_sim])
+                delta_buffer.append(max_delta)
+            except:
+                continue
+
+        self.thresh = get_dynamic_thresholds(sim_buffer, delta_buffer)
+        logger.info(f"Dynamic thresholds: { {k: round(v,4) for k,v in self.thresh.items()} }")
+
+        core_objects, verb_list, entity_positions = self._extract_core_objects(prompt, phrases_physics)
+        if not core_objects:
+            core_objects = {"default_object": {"modifiers": [], "phys": {k: 0.5 for k in self.PARAM_NAMES}}}
+
+        props = []
+        for idx, (name, data) in enumerate(core_objects.items()):
+            physics_dict = data["phys"]
+            class_type = self._classify(name)
+            surface = self._extract_surface_layers(name, prompt)
+            identity = self._compute_identity(name)
+            collider = self._estimate_collider(class_type, physics_dict)
+            mat_kwargs = {k: physics_dict.get(k, 0.5 if k != "tension" else 0.0) for k in self.PARAM_NAMES}
+            is_worn = not any(kw in prompt.lower() for kw in self.DROPPED_KEYWORDS)
+            prop = Prop(id=f"prop_{idx:03d}", name=name, class_type=class_type, physics_material=PhysicsMaterial(**mat_kwargs), collider=collider, surface_layers=surface, identity_embedding=identity, layer_order=0, tags=self._extract_tags(prompt, name), is_worn=is_worn, source_phrase=name)
+            props.append(prop)
+
+        self._ensure_body_parts(props, prompt)
+        self._auto_attach(props)
+        self._sort_layers(props)
+        logger.info(f"Assembled {len(props)} props from {len(core_objects)} objects, {len(verb_list)} verbs")
+        return props, verb_list, entity_positions
+
+    # ---------- 辅助方法 ----------
+    def _classify(self, name: str) -> str:
+        name_low = name.lower()
+        if name_low in {"person","human","man","woman","child","girl"}: return "person"
+        if name_low in self.BODY_PART_NAMES: return "body_part"
+        if name_low in {"ball","bottle","cup","book","phone","key","ring","doll"}: return "object"
+        for cat, proto in self.CLASS_PROTOTYPES.items():
+            if cat in ("person","body_part","object"): continue
+            if any(pw in name_low for pw in proto.split()): return cat
+        sims = {}
+        for cat, proto in self.CLASS_PROTOTYPES.items():
+            if cat in ("person","body_part"): continue
+            sims[cat] = np.mean([self.utils.similarity(name, pw) for pw in proto.split()])
+        if sims: return max(sims, key=sims.get)
+        return "object"
+
+    def _ensure_body_parts(self, props, prompt):
+        existing = {p.name.lower() for p in props if p.class_type == "body_part"}
+        for word in self.BODY_PART_NAMES:
+            if word in prompt.lower() and word not in existing:
+                props.append(Prop(id=f"prop_{word}_{len(props)}", name=word, class_type="body_part", physics_material=PhysicsMaterial(stiffness=0.2, elasticity=0.5, wetness=0.3, mass=1.0), collider=Collider(type="skeletal"), layer_order=-1, is_worn=True, source_phrase=word))
+                existing.add(word); logger.info(f"Created body part: {word}")
+        if not any(p.class_type == "body_part" for p in props):
+            props.append(Prop(id="prop_body_default", name="body", class_type="body_part", physics_material=PhysicsMaterial(stiffness=0.2, elasticity=0.5, wetness=0.3, mass=70.0), collider=Collider(type="skeletal"), layer_order=-1, is_worn=True, source_phrase="body"))
+
+    def _auto_attach(self, props):
+        body_parts = {p.name.lower(): p for p in props if p.class_type == "body_part"}
+        if not body_parts: return
+        for prop in props:
+            if prop.class_type not in ("clothing", "accessory"): continue
+            if not prop.is_worn: continue
+            best_region, best_sim = None, -1.0
+            for region, proto in self.WEAR_PROTOTYPES.items():
+                pwds = proto.split(); sim = sum(self.utils.similarity(prop.name, pw) for pw in pwds) / len(pwds)
+                if sim > best_sim: best_sim, best_region = sim, region
+            target = body_parts.get(best_region, body_parts.get("body", list(body_parts.values())[0]))
+            cid = f"init_{prop.id}_on_{target.id}"
+            prop.initial_constraints.append(Constraint(id=cid, type="fixed", source_prop=prop.id, target_prop=target.id, parameters={"stiffness": 1000.0}))
+
+    def _sort_layers(self, props):
+        for p in props:
+            if p.class_type == "body_part": p.layer_order = -1
+            else: p.layer_order = int(10 * (p.physics_material.stiffness - p.physics_material.elasticity + 1.0))
+            if not p.is_worn: p.layer_order += 10
+        props.sort(key=lambda p: p.layer_order)
+
+    def _extract_surface_layers(self, phrase, prompt):
+        layers = []
+        if "pattern" in phrase.lower(): layers.append(SurfaceLayer(layer_id=f"{phrase}_pattern", type="decal", texture_ref=phrase, break_behavior="split_with_surface"))
+        if "embroidery" in phrase.lower(): layers.append(SurfaceLayer(layer_id=f"{phrase}_embroidery", type="embroidery", texture_ref=phrase, break_behavior="delaminate"))
+        return layers
+
+    def _compute_identity(self, phrase): return self.utils.get_embedding(phrase).cpu().tolist()
+
+    def _extract_tags(self, prompt, phrase):
+        tags = set()
+        env = ["medieval","forest","rain","desert","battlefield"]
+        for w in env:
+            if w in prompt.lower(): tags.add(w)
+        for mat in ["steel","leather","cotton","silk","rubber","wood"]:
+            if mat in phrase.lower(): tags.add(mat)
+        return sorted(tags)
+
+    def _estimate_collider(self, class_type, physics):
+        stiff = physics.get("stiffness", 0.5)
+        if class_type == "body_part": return Collider(type="skeletal", size=[1.0,1.0,1.0], is_soft_body=True)
+        if class_type == "clothing": return Collider(type="cloth_mesh", size=[0.5,0.3,0.05], is_soft_body=True)
+        if class_type == "plant": return Collider(type="capsule", size=[0.1,0.5,0.1], is_soft_body=True)
+        if class_type == "accessory": return Collider(type="box", size=[0.2,0.1,0.05], is_soft_body=False)
+        if class_type == "weapon": return Collider(type="box", size=[0.8,0.1,0.1], is_soft_body=False)
+        if class_type == "food": return Collider(type="sphere", size=[0.1,0.1,0.1], is_soft_body=True)
+        if class_type == "vehicle": return Collider(type="box", size=[1.0,0.5,0.8], is_soft_body=False)
+        if class_type == "furniture": return Collider(type="box", size=[0.5,1.0,0.5], is_soft_body=False)
+        if class_type == "environment": return Collider(type="plane", size=[1.0,0.0,1.0], is_soft_body=False) if stiff < 0.8 else Collider(type="box", size=[1.0,0.2,1.0], is_soft_body=False)
+        return Collider(type="box", size=[0.3,0.3,0.3], is_soft_body=False)
+
+
+# ==================== InteractionAnalyzer ====================
+class InteractionAnalyzer:
+    VERB_INTERACTION_MAP = {
+        "holding": ("grasp", {"strength": 1.0}), "carrying": ("grasp", {"strength": 1.0}),
+        "wearing": ("attach", {"stiffness": 500.0}), "taking": ("detach", {"force": 2.0}),
+        "drying": ("friction_modifier", {"friction_multiplier": 1.5, "wetness": -0.3}),
+        "pushing": ("force", {"force_magnitude": 5.0}), "falling": ("gravity_trigger", {}),
+        "standing": ("support", {}), "lying": ("support", {}), "walking": ("move", {"speed": 1.0}),
+    }
+
+    PROTO_AGENTS = {
+        "holding": ["person holding", "man holding", "woman holding", "warrior holding", "girl holding", "boy holding"],
+        "drying":  ["person drying", "woman drying", "man drying", "girl drying", "boy drying"],
+        "taking":  ["person taking", "woman taking", "man taking", "girl taking", "boy taking"],
+        "wearing": ["person wearing", "woman wearing", "man wearing", "girl wearing", "boy wearing"],
+        "standing":["person standing", "man standing", "woman standing", "girl standing", "boy standing"],
+        "pushing": ["person pushing", "man pushing", "woman pushing", "boy pushing"],
+        "carrying":["person carrying", "man carrying", "woman carrying", "girl carrying", "boy carrying"],
+        "falling": ["person falling", "man falling", "woman falling", "girl falling", "boy falling"],
+        "lying":   ["person lying", "man lying", "woman lying", "girl lying", "boy lying"],
+        "walking": ["person walking", "man walking", "woman walking", "girl walking", "boy walking"],
+    }
+
+    PROTO_PATIENTS = {
+        "holding": ["holding sword", "holding cup", "holding pan", "holding towel", "holding book"],
+        "drying":  ["drying hair", "drying hands", "drying face", "drying clothes"],
+        "taking":  ["taking coat", "taking dress", "taking off coat", "taking off jacket"],
+        "wearing": ["wearing dress", "wearing coat", "wearing apron", "wearing armor"],
+        "standing":["standing on floor", "standing on ground", "standing in kitchen", "standing near wall"],
+        "pushing": ["pushing door", "pushing box", "pushing cart", "pushing stone"],
+        "carrying":["carrying sword", "carrying cup", "carrying pan", "carrying towel", "carrying book"],
+        "falling": ["falling on floor", "falling on ground", "falling off table", "falling down"],
+        "lying":   ["lying on floor", "lying on ground", "lying on table", "lying on bed"],
+        "walking": ["walking on floor", "walking on ground", "walking on street", "walking through snow"],
+    }
+
+    def __init__(self, clip_model, extractor=None):
+        self.utils = EmbedUtils(clip_model)
+        if extractor is not None:
+            self.extractor = extractor
+        else:
+            self.extractor = PhysicsExtractor()
+            self.extractor._check_and_rebuild(clip_model)
+
+    def _select_agent_for_verb(self, verb, agent_candidates):
+        if verb not in self.PROTO_AGENTS: return None
+        proto_phrases = self.PROTO_AGENTS[verb]
+        proto_embs = torch.stack([self.utils.get_embedding(p) for p in proto_phrases])
+        best_entity = None
+        best_score = 0.0
+        for entity in agent_candidates:
+            test_phrase = f"{entity} {verb}"
+            test_emb = self.utils.get_embedding(test_phrase)
+            score = torch.cosine_similarity(test_emb.unsqueeze(0), proto_embs, dim=1).max().item()
+            if score > best_score:
+                best_score = score
+                best_entity = entity
+        return best_entity if best_score > 0.5 else None
+
+    def _patient_semantic_score(self, verb, patient):
+        if verb not in self.PROTO_PATIENTS: return 0.0
+        proto_phrases = self.PROTO_PATIENTS[verb]
+        proto_embs = torch.stack([self.utils.get_embedding(p) for p in proto_phrases])
+        test_phrase = f"{verb} {patient}"
+        test_emb = self.utils.get_embedding(test_phrase)
+        return torch.cosine_similarity(test_emb.unsqueeze(0), proto_embs, dim=1).max().item()
+
+    def _learn_tension_direction(self, verb):
+        phrases = self.PROTO_PATIENTS.get(verb, [])
+        if not phrases: return 0
+        tension_sum = 0.0
+        count = 0
+        for phrase in phrases:
+            parts = phrase.split()
+            if len(parts) < 2: continue
+            patient = parts[-1]
+            try:
+                base = self.extractor.extract_from_text(patient, self.utils.clip)
+                vp = self.extractor.extract_from_text(f"{verb} {patient}", self.utils.clip)
+                tension_sum += vp["tension"] - base["tension"]
+                count += 1
+            except: continue
+        if count == 0: return 0
+        return 1 if tension_sum > 0 else -1
+
+    def _physics_deltas(self, phrase_a, phrase_b):
+        pa = self.extractor.extract_from_text(phrase_a, self.utils.clip)
+        pb = self.extractor.extract_from_text(phrase_b, self.utils.clip)
+        return {k: pa[k] - pb[k] for k in PhysicsExtractor.PARAM_NAMES}
+
+    def analyze(self, prompt, props, verb_list=None, entity_positions=None, all_modifiers=None, pure_modifiers=None):
+        constraints = []
+        if not verb_list: return constraints
+        valid_verbs = [v for v in set(verb_list) if v in self.VERB_INTERACTION_MAP]
+        if not valid_verbs: return constraints
+
+        object_entities = [p.name for p in props if p.class_type != "body_part"]
+        if len(object_entities) < 1: return constraints
+
+        if all_modifiers is None: all_modifiers = {}
+        if pure_modifiers is None: pure_modifiers = set()
+
+        agent_candidates = object_entities + [m for m in all_modifiers if m not in pure_modifiers]
+
+        verb_agent_map = {}
+        for verb in valid_verbs:
+            agent = self._select_agent_for_verb(verb, agent_candidates)
+            if agent: verb_agent_map[verb] = agent
+
+        if not verb_agent_map: return constraints
+
+        agent_names = set(verb_agent_map.values())
+        patient_pool = [e for e in object_entities if e not in agent_names and e not in pure_modifiers]
+        if not patient_pool: return constraints
+
+        verbs_with_agent = [v for v in valid_verbs if v in verb_agent_map]
+        n_verbs = len(verbs_with_agent)
+        n_patients = len(patient_pool)
+
+        score_matrix = np.zeros((n_verbs, n_patients))
+        for i, verb in enumerate(verbs_with_agent):
+            expected_dir = self._learn_tension_direction(verb)
+            for j, patient in enumerate(patient_pool):
+                sem_score = self._patient_semantic_score(verb, patient)
+                deltas = self._physics_deltas(f"{verb} {patient}", patient)
+                actual_tension = deltas.get("tension", 0.0)
+                if expected_dir == 1:
+                    tension_score = actual_tension if actual_tension >= 0 else actual_tension * 2
+                elif expected_dir == -1:
+                    tension_score = -actual_tension if actual_tension <= 0 else -actual_tension * 2
+                else:
+                    tension_score = abs(actual_tension)
+                total_mag = sum(abs(v) for v in deltas.values())
+                phys_score = tension_score * 2 + total_mag
+                score = 0.7 * sem_score + 0.3 * phys_score
+                score_matrix[i, j] = -score
+
+        row_ind, col_ind = linear_sum_assignment(score_matrix)
+
+        for i, j in zip(row_ind, col_ind):
+            verb = verbs_with_agent[i]
+            agent = verb_agent_map[verb]
+            patient = patient_pool[j]
+            if agent != patient:
+                interaction_type, params = self.VERB_INTERACTION_MAP[verb]
+                source_prop = next((p for p in props if p.name == agent), None)
+                target_prop = next((p for p in props if p.name == patient), None)
+                if source_prop and target_prop:
+                    cid = f"{verb}_{len(constraints)}_{source_prop.id}_{target_prop.id}"
+                    constraint = Constraint(id=cid, type=interaction_type, source_prop=source_prop.id,
+                                           target_prop=target_prop.id, parameters=params)
+                    constraints.append(constraint)
+                    logger.info(f"Interaction: {agent} --[{verb}]--> {patient} : {interaction_type} {params}")
+
+        seen = set()
+        unique = []
+        for c in constraints:
+            key = (c.type, c.source_prop, c.target_prop)
+            if key not in seen:
+                seen.add(key)
+                unique.append(c)
+
+        logger.info(f"InteractionAnalyzer: {len(unique)} interactions from {len(valid_verbs)} verbs")
+        return unique
+
+
+# ==================== KeyframeBuilder ====================
+class KeyframeBuilder:
+    EVENT_AXES = {
+        "tear": ("tearing apart ripping fabric shredding being torn snapping breaking apart splitting open", "intact whole solid undamaged unbroken pristine"),
+        "update_material": ("wet soak drip water rain moisture", "dry arid dehydrated"),
+        "apply_force": ("wind blow gust breeze floating", "still calm static"),
+    }
+    def __init__(self, clip_model):
+        self.utils = EmbedUtils(clip_model)
+        self._event_axes = {}
+        for etype, (pos, neg) in self.EVENT_AXES.items():
+            pos_emb = self.utils.get_embedding(pos)
+            neg_emb = self.utils.get_embedding(neg)
+            axis = pos_emb - neg_emb
+            self._event_axes[etype] = axis / (axis.norm() + 1e-6)
+
+    def build(self, prompt, props, extra_constraints=None):
+        keyframes = [self._start_frame(props, extra_constraints)]
+        events = self._detect_events(prompt, props, extra_constraints)
+        if events: keyframes.append(Keyframe(timestamp=0.5, events=events))
+        keyframes.sort(key=lambda k: k.timestamp)
+        return keyframes
+
+    def _start_frame(self, props, extra_constraints=None):
+        events = []
+        for prop in props:
+            for c in prop.initial_constraints: events.append(KeyframeEvent("create_constraint", c.id, {"constraint": c}))
+        if extra_constraints:
+            for c in extra_constraints:
+                if c.type != "force":
+                    events.append(KeyframeEvent("create_constraint", c.id, {"constraint": c}))
+                else:
+                    events.append(KeyframeEvent("apply_force", c.target_prop, {"force_magnitude": c.parameters.get("force_magnitude", 5.0)}))
+        return Keyframe(0.0, events)
+
+    def _detect_events(self, prompt, props, extra_constraints=None):
+        events = []; prompt_emb = self.utils.get_embedding(prompt)
+        for etype, axis in self._event_axes.items():
+            proj = torch.dot(prompt_emb, axis).item() / (axis.norm().item() + 1e-6)
+            threshold = 0.15 if etype == "tear" else 0.3
+            if etype == "tear" and any(kw in prompt.lower() for kw in ["tear","tears","tearing","rip","shred"]): proj = max(proj, 0.2)
+            if proj > threshold:
+                target = self._find_target(props, etype)
+                if target:
+                    params = {}
+                    if etype == "tear": params = {"tear_direction": [1,0,0]}
+                    elif etype == "update_material": params = {"wetness": 0.9}
+                    events.append(KeyframeEvent(etype, target.id, params))
+        tear_events = [e for e in events if e.type == "tear"]
+        for te in tear_events:
+            torn_prop = next((p for p in props if p.id == te.target), None)
+            if torn_prop:
+                inner = self._find_inner(props, torn_prop)
+                if inner: events.append(KeyframeEvent("expose", inner.id, {"mask_type": "tear_mask"}))
+        return events
+
+    def _find_target(self, props, etype):
+        if etype == "tear":
+            candidates = [p for p in props if p.class_type == "clothing" and p.surface_layers]
+            if candidates: return max(candidates, key=lambda p: p.physics_material.tear_intensity)
+            candidates = [p for p in props if p.class_type == "clothing"]
+            if candidates: return max(candidates, key=lambda p: p.physics_material.tear_intensity)
+        for p in props:
+            if p.class_type == "clothing": return p
+        return props[0] if props else None
+
+    def _find_inner(self, props, torn_prop):
+        sorted_props = sorted(props, key=lambda p: p.layer_order)
+        for p in sorted_props:
+            if p.id != torn_prop.id and p.layer_order < torn_prop.layer_order: return p
+        return None
+
+
+# ==================== PhysicsStage ====================
+class PhysicsStage:
+    def __init__(self, clip_model):
+        self.clip = clip_model
+        self.extractor = PhysicsExtractor()
+        self.extractor._check_and_rebuild(clip_model)
+
+        self.assembler = PropAssembler(clip_model)
+        self.assembler.set_extractor(self.extractor)
+
+        self.analyzer = InteractionAnalyzer(clip_model, extractor=self.extractor)
+        self.builder = KeyframeBuilder(clip_model)
+
+    def generate_scene(self, prompt: str, is_video: bool = True) -> SceneDescription:
+        logger.info(f"=== Generating scene: {prompt[:60]}... ===")
+        phrases_phys = self.extractor.extract_full_physics_vectors(prompt, self.clip)
+        if not phrases_phys:
+            logger.warning("No phrases extracted, returning empty scene.")
+            return SceneDescription()
+
+        props, verb_list, entity_positions = self.assembler.assemble(phrases_phys, prompt)
+        extra_constraints = []
+        if is_video and verb_list:
+            extra_constraints = self.analyzer.analyze(
+                prompt, props, verb_list, entity_positions,
+                all_modifiers=self.assembler._all_modifiers,
+                pure_modifiers=self.assembler._pure_modifiers
+            )
+
+        keyframes = self.builder.build(prompt, props,
+                                       extra_constraints if extra_constraints else None)
+
+        world = WorldConfig()
+        scene = SceneDescription(world=world, props=props, keyframes=keyframes)
+        logger.info(f"Scene ready: {len(props)} props, {len(keyframes)} keyframes, {len(extra_constraints)} interactions")
+        return scene
